@@ -1,0 +1,127 @@
+pipeline {
+    agent any
+    environment {
+        GITHUB_REPO = 'https://github.com/in28minutes/spring-boot-examples.git'  // Repo URL
+        BRANCH = 'master'  // Change branch if necessary
+        ECS_CLUSTER = 'interview_test_cluster'  // ECS cluster name
+        ECS_SERVICE = 'interview_test_service'  // ECS service name
+        FARGATE_TASK_DEFINITION = 'spring-boot-app-task-definition-fargate'  // New task definition name for Fargate
+    }
+
+    stages {
+        stage('Clone GitHub Repo') {
+            steps {
+                git branch: "${BRANCH}", url: "${GITHUB_REPO}"
+            }
+        }
+
+        stage('Build with Maven') {
+            steps {
+                script {
+                    // Use Maven to build the project and run tests
+                    sh '''
+                    cd spring-boot-2-rest-service-with-swagger
+                    mvn clean install -DskipTests
+                    ''' 
+                }
+            }
+        }
+
+        stage('Run Unit Tests') {
+            steps {
+                script {
+                    // Run unit tests
+                    sh '''
+                    cd spring-boot-2-rest-service-with-swagger
+                    mvn test
+                    ''' 
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    // Ensure the correct path is used for the Dockerfile
+                    sh 'docker build -t dskamble1993/spring-boot-app:v1 -f spring-boot-2-rest-service-with-swagger/Dockerfile .'
+                }
+            }
+        }
+
+        stage('Login to Docker Hub') {
+            steps {
+                script {
+                    // Log in to Docker Hub
+                    withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                        sh 'echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin'
+                    }
+                }
+            }
+        }
+
+        stage('Push Docker Image to Docker Hub') {
+            steps {
+                script {
+                    // Push the Docker image to Docker Hub
+                    sh 'docker push dskamble1993/spring-boot-app:v1'
+                }
+            }
+        }
+
+        stage('Create New ECS Task Definition for Fargate') {
+            steps {
+                script {
+                    // Create a new ECS Task Definition for Fargate
+                    sh """
+                    aws ecs register-task-definition \
+                        --family ${FARGATE_TASK_DEFINITION} \
+                        --execution-role-arn arn:aws:iam::135808919660:role/ecsTaskExecutionRole \
+                        --task-role-arn arn:aws:iam::135808919660:role/ecsTaskExecutionRole \
+                        --network-mode awsvpc \
+                        --cpu "256" \
+                        --memory "512" \
+                        --requires-compatibilities FARGATE \
+                        --container-definitions '[
+                            {
+                                "name": "spring-boot-container",
+                                "image": "dskamble1993/spring-boot-app:v1",
+                                "cpu": 256,
+                                "memory": 512,
+                                "essential": true,
+                                "portMappings": [
+                                    {
+                                        "containerPort": 9090,
+                                        "hostPort": 9090
+                                    }
+                                ]
+                            }
+                        ]'
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to ECS (Fargate)') {
+            steps {
+                script {
+                    // Deploy the ECS service on Fargate
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
+                        sh """
+                        ecs_task_definition=\$(aws ecs describe-task-definition --task-definition ${FARGATE_TASK_DEFINITION} --query 'taskDefinition.taskDefinitionArn' --output text)
+                        aws ecs update-service --cluster ${ECS_CLUSTER} --service ${ECS_SERVICE} --force-new-deployment --task-definition \${ecs_task_definition} --desired-count 1 --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[subnet-xxxxxxxx],securityGroups=[sg-xxxxxxxx],assignPublicIp=ENABLED}"
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Deployment completed successfully!'
+        }
+        failure {
+            echo 'Deployment failed.'
+        }
+    }
+}
